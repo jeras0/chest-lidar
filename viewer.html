@@ -1,0 +1,167 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chest Lidar View</title>
+<style>
+  body { margin: 0; background: #0d1117; color: #e6edf3; font-family: system-ui, sans-serif; }
+  header { display: flex; gap: 16px; align-items: center; padding: 10px 16px; flex-wrap: wrap; }
+  #status { font-size: 28px; font-weight: 700; min-width: 220px; }
+  .clear { color: #3fb950; } .z2 { color: #d29922; } .z1 { color: #f0883e; } .z0 { color: #f85149; }
+  button, select { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 6px 10px; font-size: 14px; }
+  #info { color: #8b949e; font-size: 14px; }
+  canvas { display: block; width: 100vw; height: calc(100vh - 60px); }
+  #cam { position: fixed; right: 12px; bottom: 12px; width: min(40vw, 480px); border: 1px solid #30363d;
+         border-radius: 6px; display: none; }
+</style>
+</head>
+<body>
+<header>
+  <div id="status">connecting...</div>
+  <label>Range <select id="range"><option>2</option><option selected>4</option><option>10</option></select> m</label>
+  <label>FOV <select id="fov"><option>30</option><option>60</option><option>70</option><option>90</option><option>120</option><option>270</option></select>&deg;</label>
+  <button id="sound">Laptop sound: off</button>
+  <button id="voice">Laptop voice: off</button>
+  <span id="info"></span>
+</header>
+<canvas id="c"></canvas>
+<img id="cam" alt="camera">
+<script>
+const c = document.getElementById('c'), ctx = c.getContext('2d');
+const statusEl = document.getElementById('status'), infoEl = document.getElementById('info');
+const rangeSel = document.getElementById('range'), soundBtn = document.getElementById('sound');
+const fovSel = document.getElementById('fov');
+let fovSynced = false;
+// changing the dropdown changes the alert wedge on the Orin itself, not just this view
+fovSel.onchange = () => fetch('/set?fov=' + fovSel.value);
+const ZONE_COLORS = ['#f85149', '#f0883e', '#d29922'];
+const ZONE_NAMES = ['STOP', 'CLOSE', 'CAUTION'];
+let frame = null, lastMsg = 0;
+
+// optional beeping on the laptop too, handy for demos
+let audio = null, soundOn = false, nextBeep = 0;
+soundBtn.onclick = () => {
+  soundOn = !soundOn;
+  if (!audio) audio = new AudioContext();
+  soundBtn.textContent = 'Laptop sound: ' + (soundOn ? 'on' : 'off');
+};
+function beep(len) {
+  const o = audio.createOscillator(), g = audio.createGain();
+  o.frequency.value = 880; o.connect(g); g.connect(audio.destination);
+  o.start(); o.stop(audio.currentTime + len);
+}
+setInterval(() => {
+  if (!soundOn || !frame || frame.zone === null || Date.now() < nextBeep) return;
+  const gap = [0.1, 0.2, 0.55][frame.zone];
+  beep(0.08); nextBeep = Date.now() + gap * 1000;
+}, 20);
+
+const es = new EventSource('/stream');
+es.onmessage = e => {
+  frame = JSON.parse(e.data); lastMsg = Date.now();
+  if (!fovSynced) {  // show the Orin's current setting on first load
+    const total = String(Math.round(frame.fov * 2));
+    if (![...fovSel.options].some(o => o.value === total)) fovSel.add(new Option(total));
+    fovSel.value = total; fovSynced = true;
+  }
+};
+
+// camera labels from vision.py, which runs next to this server on port 8001
+const camEl = document.getElementById('cam'), voiceBtn = document.getElementById('voice');
+let vision = null, lastVision = 0, voiceOn = false, lastSaid = null;
+voiceBtn.onclick = () => {
+  voiceOn = !voiceOn;
+  voiceBtn.textContent = 'Laptop voice: ' + (voiceOn ? 'on' : 'off');
+};
+const vs = new EventSource('http://' + location.hostname + ':8001/dets');
+// fetch the next camera frame shortly after the last one has loaded (~10-15 fps on Wi-Fi)
+function nextCamFrame() {
+  if (camEl.style.display === 'block') camEl.src = 'http://' + location.hostname + ':8001/frame.jpg?' + Date.now();
+}
+camEl.onload = () => setTimeout(nextCamFrame, 60);
+camEl.onerror = () => setTimeout(nextCamFrame, 500);
+vs.onmessage = e => {
+  vision = JSON.parse(e.data); lastVision = Date.now();
+  if (camEl.style.display !== 'block') { camEl.style.display = 'block'; nextCamFrame(); }
+  if (lastSaid === null) lastSaid = vision.said.seq;  // don't replay an old announcement on load
+  if (vision.said.seq !== lastSaid) {
+    lastSaid = vision.said.seq;
+    if (voiceOn) { speechSynthesis.cancel(); speechSynthesis.speak(new SpeechSynthesisUtterance(vision.said.text)); }
+  }
+};
+
+function draw() {
+  const dpr = window.devicePixelRatio || 1;
+  const W = c.clientWidth, H = c.clientHeight;
+  if (c.width !== W * dpr) { c.width = W * dpr; c.height = H * dpr; }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  const maxM = +rangeSel.value;
+  const cx = W / 2, cy = H * 0.62;               // wearer position
+  const scale = Math.min(W / 2, cy) / maxM;      // pixels per metre
+  const toXY = (a, d) => [cx - Math.sin(a) * d * scale, cy - Math.cos(a) * d * scale];
+
+  // range rings
+  ctx.strokeStyle = '#30363d'; ctx.fillStyle = '#8b949e'; ctx.font = '12px system-ui';
+  for (let m = 1; m <= maxM; m += maxM > 5 ? 2 : 1) {
+    ctx.beginPath(); ctx.arc(cx, cy, m * scale, 0, 2 * Math.PI); ctx.stroke();
+    ctx.fillText(m + ' m', cx + 4, cy - m * scale - 4);
+  }
+
+  const stale = Date.now() - lastMsg > 1500;
+  if (!frame || stale) {
+    statusEl.textContent = 'no data'; statusEl.className = '';
+    requestAnimationFrame(draw); return;
+  }
+
+  // alert wedge and zone arcs
+  const half = frame.fov * Math.PI / 180;
+  frame.zones.slice().reverse().forEach((z, ri) => {
+    const i = frame.zones.length - 1 - ri;
+    ctx.beginPath(); ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, z * scale, -Math.PI / 2 - half, -Math.PI / 2 + half);
+    ctx.closePath();
+    ctx.fillStyle = ZONE_COLORS[i] + (frame.zone === i ? '55' : '18'); ctx.fill();
+  });
+
+  // scan points
+  ctx.fillStyle = '#58a6ff';
+  frame.r.forEach((mm, k) => {
+    if (mm < 20) return;
+    const a = (k * frame.step - 540) * 0.25 * Math.PI / 180;
+    const [x, y] = toXY(a, mm / 1000);
+    ctx.fillRect(x - 1.5, y - 1.5, 3, 3);
+  });
+
+  // camera labels at the distance the lidar measured for them
+  const visionLive = vision && Date.now() - lastVision < 1500;
+  if (visionLive) {
+    ctx.font = 'bold 14px system-ui';
+    vision.dets.forEach(d => {
+      if (d.dist === null) return;
+      const [x, y] = toXY(d.angle * Math.PI / 180, d.dist);
+      ctx.fillStyle = '#ffc800';
+      ctx.beginPath(); ctx.arc(x, y, 6, 0, 2 * Math.PI); ctx.fill();
+      ctx.fillText(d.label + ' ' + d.dist.toFixed(1) + ' m', x + 9, y + 5);
+    });
+  } else if (vision) {
+    camEl.style.display = 'none';
+  }
+
+  // wearer
+  ctx.fillStyle = '#e6edf3';
+  ctx.beginPath(); ctx.moveTo(cx, cy - 10); ctx.lineTo(cx - 7, cy + 8); ctx.lineTo(cx + 7, cy + 8); ctx.fill();
+
+  const z = frame.zone;
+  statusEl.textContent = (z === null ? 'CLEAR' : ZONE_NAMES[z]) +
+    (frame.nearest !== null ? '  ' + frame.nearest.toFixed(2) + ' m' : '');
+  statusEl.className = z === null ? 'clear' : 'z' + z;
+  infoEl.textContent = frame.hz + ' scans/s' + (visionLive ? ' · camera ' + vision.fps + ' fps' : '');
+  requestAnimationFrame(draw);
+}
+draw();
+</script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+[Unit]
+Description=Chest lidar obstacle alert
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# change the path if you copied the folder somewhere else
+WorkingDirectory=/home/jetson/lidar-stack
+ExecStart=/usr/bin/python3 /home/jetson/lidar-stack/obstacle_alert.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
